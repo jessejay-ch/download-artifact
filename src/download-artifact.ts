@@ -1,61 +1,136 @@
-import * as core from '@actions/core'
-import * as artifact from '@actions/artifact'
 import * as os from 'os'
-import {resolve} from 'path'
+import * as path from 'path'
+import * as core from '@actions/core'
+import artifactClient from '@actions/artifact'
+import type {Artifact, FindOptions} from '@actions/artifact'
+import {Minimatch} from 'minimatch'
 import {Inputs, Outputs} from './constants'
 
+const PARALLEL_DOWNLOADS = 5
+
+export const chunk = <T>(arr: T[], n: number): T[][] =>
+  arr.reduce((acc, cur, i) => {
+    const index = Math.floor(i / n)
+    acc[index] = [...(acc[index] || []), cur]
+    return acc
+  }, [] as T[][])
+
 async function run(): Promise<void> {
-  try {
-    const name = core.getInput(Inputs.Name, {required: false})
-    const path = core.getInput(Inputs.Path, {required: false})
+  const inputs = {
+    name: core.getInput(Inputs.Name, {required: false}),
+    path: core.getInput(Inputs.Path, {required: false}),
+    token: core.getInput(Inputs.GitHubToken, {required: false}),
+    repository: core.getInput(Inputs.Repository, {required: false}),
+    runID: parseInt(core.getInput(Inputs.RunID, {required: false})),
+    pattern: core.getInput(Inputs.Pattern, {required: false}),
+    mergeMultiple: core.getBooleanInput(Inputs.MergeMultiple, {required: false})
+  }
 
-    let resolvedPath
-    // resolve tilde expansions, path.replace only replaces the first occurrence of a pattern
-    if (path.startsWith(`~`)) {
-      resolvedPath = resolve(path.replace('~', os.homedir()))
-    } else {
-      resolvedPath = resolve(path)
+  if (!inputs.path) {
+    inputs.path = process.env['GITHUB_WORKSPACE'] || process.cwd()
+  }
+
+  if (inputs.path.startsWith(`~`)) {
+    inputs.path = inputs.path.replace('~', os.homedir())
+  }
+
+  const isSingleArtifactDownload = !!inputs.name
+  const resolvedPath = path.resolve(inputs.path)
+  core.debug(`Resolved path is ${resolvedPath}`)
+
+  const options: FindOptions = {}
+  if (inputs.token) {
+    const [repositoryOwner, repositoryName] = inputs.repository.split('/')
+    if (!repositoryOwner || !repositoryName) {
+      throw new Error(
+        `Invalid repository: '${inputs.repository}'. Must be in format owner/repo`
+      )
     }
-    core.debug(`Resolved path is ${resolvedPath}`)
 
-    const artifactClient = artifact.create()
-    if (!name) {
-      // download all artifacts
-      core.info('No artifact name specified, downloading all artifacts')
+    options.findBy = {
+      token: inputs.token,
+      workflowRunId: inputs.runID,
+      repositoryName,
+      repositoryOwner
+    }
+  }
+
+  let artifacts: Artifact[] = []
+
+  if (isSingleArtifactDownload) {
+    core.info(`Downloading single artifact`)
+
+    const {artifact: targetArtifact} = await artifactClient.getArtifact(
+      inputs.name,
+      options
+    )
+
+    if (!targetArtifact) {
+      throw new Error(`Artifact '${inputs.name}' not found`)
+    }
+
+    core.debug(
+      `Found named artifact '${inputs.name}' (ID: ${targetArtifact.id}, Size: ${targetArtifact.size})`
+    )
+
+    artifacts = [targetArtifact]
+  } else {
+    const listArtifactResponse = await artifactClient.listArtifacts({
+      latest: true,
+      ...options
+    })
+    artifacts = listArtifactResponse.artifacts
+
+    core.debug(`Found ${artifacts.length} artifacts in run`)
+
+    if (inputs.pattern) {
+      core.info(`Filtering artifacts by pattern '${inputs.pattern}'`)
+      const matcher = new Minimatch(inputs.pattern)
+      artifacts = artifacts.filter(artifact => matcher.match(artifact.name))
+      core.debug(
+        `Filtered from ${listArtifactResponse.artifacts.length} to ${artifacts.length} artifacts`
+      )
+    } else {
       core.info(
-        'Creating an extra directory for each artifact that is being downloaded'
+        'No input name or pattern filtered specified, downloading all artifacts'
       )
-      const downloadResponse = await artifactClient.downloadAllArtifacts(
-        resolvedPath
-      )
-      core.info(`There were ${downloadResponse.length} artifacts downloaded`)
-      for (const artifact of downloadResponse) {
+      if (!inputs.mergeMultiple) {
         core.info(
-          `Artifact ${artifact.artifactName} was downloaded to ${artifact.downloadPath}`
+          'An extra directory with the artifact name will be created for each download'
         )
       }
-    } else {
-      // download a single artifact
-      core.info(`Starting download for ${name}`)
-      const downloadOptions = {
-        createArtifactFolder: false
-      }
-      const downloadResponse = await artifactClient.downloadArtifact(
-        name,
-        resolvedPath,
-        downloadOptions
-      )
-      core.info(
-        `Artifact ${downloadResponse.artifactName} was downloaded to ${downloadResponse.downloadPath}`
-      )
     }
-    // output the directory that the artifact(s) was/were downloaded to
-    // if no path is provided, an empty string resolves to the current working directory
-    core.setOutput(Outputs.DownloadPath, resolvedPath)
-    core.info('Artifact download has finished successfully')
-  } catch (err) {
-    core.setFailed(err.message)
   }
+
+  if (artifacts.length) {
+    core.info(`Preparing to download the following artifacts:`)
+    artifacts.forEach(artifact => {
+      core.info(
+        `- ${artifact.name} (ID: ${artifact.id}, Size: ${artifact.size})`
+      )
+    })
+  }
+
+  const downloadPromises = artifacts.map(artifact =>
+    artifactClient.downloadArtifact(artifact.id, {
+      ...options,
+      path:
+        isSingleArtifactDownload || inputs.mergeMultiple
+          ? resolvedPath
+          : path.join(resolvedPath, artifact.name)
+    })
+  )
+
+  const chunkedPromises = chunk(downloadPromises, PARALLEL_DOWNLOADS)
+  for (const chunk of chunkedPromises) {
+    await Promise.all(chunk)
+  }
+
+  core.info(`Total of ${artifacts.length} artifact(s) downloaded`)
+  core.setOutput(Outputs.DownloadPath, resolvedPath)
+  core.info('Download artifact has finished successfully')
 }
 
-run()
+run().catch(err =>
+  core.setFailed(`Unable to download artifact(s): ${err.message}`)
+)
